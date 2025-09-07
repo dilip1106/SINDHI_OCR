@@ -1,0 +1,9 @@
+venv
+data
+__pycache__
+test1.tar.xz
+sindhi_ocr_dilip.pth
+sindhi_ocr_model.pth   
+interrupted_checkpoint_epoch_0.pth
+val_data
+test1
