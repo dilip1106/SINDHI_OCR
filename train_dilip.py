@@ -13,6 +13,7 @@ import os
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +23,9 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+
+cudnn.benchmark = True
+cudnn.deterministic = False
 
 class SindhiOCRDataset(Dataset):
     def __init__(self, root_dir: str, labels_file: str, imgH: int = 48, maxW: int = 512, rtl: bool = True, augment: bool = False):
@@ -67,6 +71,26 @@ class SindhiOCRDataset(Dataset):
                 ToTensorV2(),
             ])
 
+        # Pre-load images into memory for faster training
+        self.images = []
+        logging.info("Loading images into memory...")
+        for idx, (img_path, _) in enumerate(self.samples):
+            try:
+                img = Image.open(img_path).convert("L")
+                w, h = img.size
+                new_w = min(int(self.imgH * w / h), self.maxW)
+                img = img.resize((new_w, self.imgH), Image.Resampling.BILINEAR)
+                img_np = np.array(img, dtype=np.float32)
+                if self.rtl:
+                    img_np = np.fliplr(img_np).copy()
+                self.images.append(img_np)
+                
+                if idx % 1000 == 0:
+                    logging.info(f"Loaded {idx}/{len(self.samples)} images")
+            except Exception as e:
+                logging.error(f"Error loading image {img_path}: {e}")
+                raise
+
     def _build_samples(self):
         samples = []
         for idx, label in enumerate(self.labels):
@@ -83,23 +107,11 @@ class SindhiOCRDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        try:
-            img = Image.open(img_path).convert("L")
-            w, h = img.size
-            new_w = min(int(self.imgH * w / h), self.maxW)
-            img = img.resize((new_w, self.imgH), Image.Resampling.BILINEAR)
-            
-            img_np = np.array(img, dtype=np.float32) / 255.0
-            if self.rtl:
-                img_np = np.fliplr(img_np).copy()
-            
-            transformed = self.transform(image=img_np)
-            img_tensor = transformed["image"]
-            return img_tensor, label
-        except Exception as e:
-            logging.error(f"Error processing image {img_path}: {e}")
-            raise
+        img_np, label = self.images[idx], self.samples[idx][1]
+        img_np = img_np[np.newaxis, :, :]  # Add channel dimension
+        transformed = self.transform(image=img_np)
+        img_tensor = transformed["image"].float()
+        return img_tensor, label
 
 class CRNN(nn.Module):
     def __init__(self, num_classes: int, dropout_rate: float = 0.2):
@@ -163,22 +175,34 @@ def train_model(args):
             dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=args.num_workers,
-            pin_memory=True
+            num_workers=8,  # Increased for faster data loading
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4  # Increased prefetching
         )
 
+        # Print dataset info
+        logging.info(f"Dataset size: {len(dataset)}")
+        logging.info(f"Number of batches: {len(train_loader)}")
+        
+        # Create character mapping
         chars = sorted(set("".join(dataset.labels)))
+        logging.info(f"Number of unique characters: {len(chars)}")
         char_to_idx = {char: idx for idx, char in enumerate(chars)}
-        num_classes = len(chars) + 1
-
+        num_classes = len(chars) + 1  # +1 for CTC blank
+        
+        # Initialize model
         model = CRNN(num_classes=num_classes)
         model = model.to(device)
         
+        # Print model info
+        logging.info(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
+
         start_epoch = 0
         best_loss = float('inf')
         
         criterion = nn.CTCLoss(blank=num_classes-1, zero_infinity=True)
-        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
 
         if args.resume:
@@ -198,53 +222,38 @@ def train_model(args):
         accumulation_steps = args.accumulation_steps
         warmup_epochs = args.warmup_epochs
 
+        # Enable automatic mixed precision training
+        scaler = torch.cuda.amp.GradScaler()
+
         for epoch in range(start_epoch, args.epochs):
             try:
                 model.train()
                 total_loss = 0
                 current_loss = 0
                 
-                if epoch < warmup_epochs:
-                    lr = args.learning_rate * (epoch + 1) / warmup_epochs
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr
-                else:
-                    lr = args.learning_rate
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr
-
                 for batch_idx, (images, texts) in enumerate(train_loader):
-                    images = images.to(device)
+                    images = images.to(device, non_blocking=True)
                     
-                    target_lengths = []
-                    targets = []
-                    for text in texts:
-                        indices = [char_to_idx[c] for c in text]
-                        targets.extend(indices)
-                        target_lengths.append(len(indices))
-                        
-                    targets = torch.tensor(targets, dtype=torch.long).to(device)
-                    target_lengths = torch.tensor(target_lengths, dtype=torch.long)
-                    
-                    outputs = model(images)
-                    output_log_probs = F.log_softmax(outputs, dim=2)
-                    input_lengths = torch.full((images.size(0),), outputs.size(1), dtype=torch.long)
-                    
-                    loss = criterion(output_log_probs.permute(1, 0, 2), targets, input_lengths, target_lengths)
-                    
-                    loss = loss / accumulation_steps
-                    loss.backward()
-                    
-                    if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
-                    
+                    # Use automatic mixed precision
+                    with torch.cuda.amp.autocast():
+                        outputs = model(images)
+                        output_log_probs = F.log_softmax(outputs, dim=2)
+                        input_lengths = torch.full(size=(images.size(0),), fill_value=outputs.size(1), dtype=torch.long)
+                        loss = criterion(output_log_probs.permute(1, 0, 2), targets, input_lengths, target_lengths)
+        
+                    # Direct optimization without accumulation
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
                     total_loss += loss.item() * accumulation_steps
                     current_loss = total_loss / (batch_idx + 1)
                     
                     if batch_idx % args.log_interval == 0:
-                        logging.info(f'Epoch: {epoch+1}/{args.epochs} [{batch_idx}/{len(train_loader)}] Loss: {current_loss:.4f} LR: {lr:.6f}')
+                        logging.info(f'Epoch: {epoch+1}/{args.epochs} [{batch_idx}/{len(train_loader)}] Loss: {current_loss:.4f} LR: {optimizer.param_groups[0]["lr"]:.6f}')
 
                 avg_loss = total_loss / len(train_loader)
                 scheduler.step(avg_loss)
@@ -292,7 +301,16 @@ if __name__ == "__main__":
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')
     parser.add_argument('--accumulation-steps', type=int, default=4, help='Number of steps to accumulate gradients')
     parser.add_argument('--warmup-epochs', type=int, default=5, help='Number of epochs for learning rate warm-up')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     
     args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Print all arguments
+    logging.info("Training arguments:")
+    for arg, value in vars(args).items():
+        logging.info(f"  {arg}: {value}")
     
     train_model(args)

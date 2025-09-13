@@ -253,7 +253,7 @@ def train_model(args):
                     'loss': current_loss,  # Use current_loss here
                     'char_to_idx': char_to_idx,
                 }, f'interrupted_checkpoint_epoch_{epoch}.pth')
-                logging.info(f'Checkpoint saved to interrupted_checkpoint_epoch_{epoch}.pth')
+                logging.info(f'Checkpoint saved to interrupted_checkpoint_epoch_sahas_s{epoch}.pth')
                 return  # Exit training gracefully
 
     except Exception as e:
